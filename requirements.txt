@@ -1,0 +1,12 @@
+openai
+SpeechRecognition
+pyttsx3
+pygame
+customtkinter
+pillow
+requests
+python-dotenv
+pyaudio
+pvporcupine
+sounddevice
+numpy
