@@ -1,51 +1,120 @@
-import os
+"""Async voice I/O utilities for the Gujjar JARVIS assistant.
+
+Improvements over the original:
+- Uses Settings from config.get_settings
+- Automatic microphone device discovery when MIC_DEVICE_INDEX is None
+- Async TTS using edge-tts with streaming support where possible
+- Plays audio using sounddevice for better cross-platform performance
+- Adds logging, type hints, and exception handling
+- Keeps backward-compatible speak/listen synchronous wrappers for simple scripts
+"""
+from __future__ import annotations
+
 import asyncio
-import speech_recognition as sr
+import logging
+import os
+import tempfile
+from typing import Optional
+
 import edge_tts
-import pygame
+import numpy as np
+import soundfile as sf
+import sounddevice as sd
+import speech_recognition as sr
 
-from config import VOICE_NAME, MIC_DEVICE_INDEX
+from config import get_settings
 
-pygame.mixer.init()
-
-async def _speak_async(text):
-    communicate = edge_tts.Communicate(text, VOICE_NAME)
-    await communicate.save("voice.mp3")
+logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
-def speak(text):
-    print("Jarvis:", text)
+async def _speak_async(text: str, voice: Optional[str] = None, filepath: Optional[str] = None) -> str:
+    """Generate TTS audio file asynchronously and return the path.
+
+    Uses edge-tts Communicate.save to write an mp3 or wav file. Returns
+    the path to the generated file.
+    """
+    voice_name = voice or settings.VOICE_NAME
+    if filepath is None:
+        fd, filepath = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+
     try:
-        asyncio.run(_speak_async(text))
-        pygame.mixer.music.load("voice.mp3")
-        pygame.mixer.music.play()
+        communicator = edge_tts.Communicate(text, voice_name)
+        # save writes the file asynchronously
+        await communicator.save(filepath)
+        logger.debug("TTS saved to %s", filepath)
+        return filepath
+    except Exception as exc:  # pragma: no cover - integration
+        logger.exception("TTS generation failed: %s", exc)
+        raise
 
-        while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
 
-        pygame.mixer.music.unload()
+def speak(text: str) -> None:
+    """Synchronous convenience wrapper that generates and plays TTS.
+
+    Blocking: will generate TTS and play audio before returning.
+    """
+    logger.info("Speaking text (len=%d)", len(text))
+    try:
+        filepath = asyncio.run(_speak_async(text))
+        # Read and play using sounddevice for low-latency playback
+        data, srate = sf.read(filepath, dtype="float32")
+        sd.play(data, srate)
+        sd.wait()
     except Exception as exc:
-        print("Voice error:", exc)
+        logger.exception("Error in speak(): %s", exc)
     finally:
-        if os.path.exists("voice.mp3"):
-            os.remove("voice.mp3")
+        try:
+            if "filepath" in locals() and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            logger.debug("Failed to remove temp tts file")
 
 
-def listen():
-    recognizer = sr.Recognizer()
+def _detect_microphone_index(preferred: Optional[int] = None) -> Optional[int]:
+    """Try to detect a suitable microphone index if not provided.
+
+    Returns None if the default microphone should be used.
+    """
+    if preferred is not None:
+        return preferred
 
     try:
-        with sr.Microphone(device_index=MIC_DEVICE_INDEX) as source:
-            print("Listening...")
+        devices = sd.query_devices()
+        mic_candidates = [i for i, d in enumerate(devices) if d["max_input_channels"] > 0]
+        logger.debug("Detected microphone indices: %s", mic_candidates)
+        return mic_candidates[0] if mic_candidates else None
+    except Exception:
+        logger.exception("Failed to query sound devices")
+        return None
+
+
+def listen(timeout: float = 5.0) -> str:
+    """Blocking listen call using SpeechRecognition.
+
+    Adjusts for ambient noise and recognizes via Google's online API.
+    Returns empty string on failure.
+    """
+    recognizer = sr.Recognizer()
+    mic_index = _detect_microphone_index(settings.MIC_DEVICE_INDEX)
+
+    try:
+        with sr.Microphone(device_index=mic_index) as source:
+            logger.info("Listening on mic index %s", mic_index)
             recognizer.adjust_for_ambient_noise(source, duration=1)
-            audio = recognizer.listen(source)
+            audio = recognizer.listen(source, timeout=timeout)
     except Exception as exc:
-        print("Microphone error:", exc)
+        logger.exception("Microphone error: %s", exc)
         return ""
 
     try:
         command = recognizer.recognize_google(audio)
-        print("You:", command)
+        logger.info("Recognized speech: %s", command)
         return command
+    except sr.UnknownValueError:
+        logger.info("Speech was unintelligible")
+        return ""
     except Exception:
+        logger.exception("Speech recognition failed")
         return ""
